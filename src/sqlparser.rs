@@ -118,6 +118,7 @@ impl Parser {
                     "INSERT" => Ok(self.parse_insert()?),
                     "ALTER" => Ok(self.parse_alter()?),
                     "COPY" => Ok(self.parse_copy()?),
+                    "BEGIN" => Ok(self.parse_transaction()?),
                     _ => parser_err!(format!(
                         "Unexpected keyword {:?} at the beginning of a statement",
                         w.to_string()
@@ -1706,6 +1707,7 @@ impl Parser {
 
     /// Parse a LIMIT clause
     pub fn parse_limit(&mut self) -> Result<Option<ASTNode>, ParserError> {
+        self.parse_statement()?;
         if self.parse_keyword("ALL") {
             Ok(None)
         } else {
@@ -1747,6 +1749,24 @@ impl Parser {
             quantity,
         })
     }
+
+    pub fn parse_transaction(&mut self) -> Result<SQLStatement, ParserError> {
+        let mut stmts = Vec::new();
+        while self.consume_token(&Token::SemiColon) {
+            ;
+        }
+        while let Some(Token::SQLWord(w)) = self.peek_token() {
+            if w.keyword == "COMMIT" {
+                break;
+            }
+            let stmt = self.parse_statement()?;
+            stmts.push(Box::new(stmt));
+        }
+        while self.consume_token(&Token::SemiColon) {
+            ;
+        }
+        Ok(SQLStatement::SQLTransaction(stmts))
+    }
 }
 
 impl SQLWord {
@@ -1759,6 +1779,7 @@ impl SQLWord {
 mod tests {
     use super::*;
     use crate::test_utils::all_dialects;
+    use crate::sqlast::ASTNode::SQLFunction;
 
     #[test]
     fn test_prev_index() {
@@ -1771,6 +1792,40 @@ mod tests {
             assert_eq!(parser.peek_token(), Some(Token::make_word("version", None)));
             assert_eq!(parser.prev_token(), Some(Token::make_keyword("SELECT")));
             assert_eq!(parser.prev_token(), None);
+        });
+    }
+
+    #[test]
+    fn test_transaction() {
+        let sql = "BEGIN;\nSELECT version();\nCOMMIT;";
+        all_dialects().run_parser_method(sql, |parser| {
+            assert_eq!(parser.parse_statement(), Ok(SQLStatement::SQLTransaction(vec![
+                Box::new(SQLStatement::SQLQuery(Box::new(SQLQuery {
+                    ctes: vec![],
+                    body: SQLSetExpr::Select(Box::new(
+                        SQLSelect {
+                            distinct: false,
+                            projection: vec![
+                                SQLSelectItem::UnnamedExpression(SQLFunction {
+                                    name: SQLObjectName(vec!["version".to_owned()]),
+                                    args: vec![],
+                                    over: None,
+                                    distinct: false,
+                                })
+                            ],
+                            relation: None,
+                            joins: vec![],
+                            selection: None,
+                            group_by: vec![],
+                            having: None,
+                        }
+                    )),
+                    fetch: None,
+                    offset: None,
+                    order_by: vec![],
+                    limit: None,
+                }))),
+            ])));
         });
     }
 }

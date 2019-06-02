@@ -413,6 +413,7 @@ pub enum SQLStatement {
         names: Vec<SQLObjectName>,
         cascade: bool,
     },
+    SQLTransaction(Vec<Box<SQLStatement>>),
 }
 
 impl ToString for SQLStatement {
@@ -532,6 +533,10 @@ impl ToString for SQLStatement {
                 if *if_exists { " IF EXISTS" } else { "" },
                 comma_separated_string(&names),
                 if *cascade { " CASCADE" } else { "" },
+            ),
+            SQLStatement::SQLTransaction(stmts) => format!(
+                "BEGIN;\n{}\nCOMMIT;",
+                stmts.iter().map(|s| s.to_string()).collect::<Vec<String>>().join("\n"),
             ),
         }
     }
