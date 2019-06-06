@@ -14,26 +14,33 @@
 
 //! SQL Abstract Syntax Tree (AST) types
 
+mod ddl;
 mod query;
 mod sql_operator;
 mod sqltype;
-mod table_key;
 mod value;
 
+use std::ops::Deref;
+
+pub use self::ddl::{AlterTableOperation, TableConstraint};
 pub use self::query::{
     Cte, Fetch, Join, JoinConstraint, JoinOperator, SQLOrderByExpr, SQLQuery, SQLSelect,
-    SQLSelectItem, SQLSetExpr, SQLSetOperator, TableFactor,
+    SQLSelectItem, SQLSetExpr, SQLSetOperator, SQLValues, TableAlias, TableFactor,
 };
 pub use self::sqltype::SQLType;
-pub use self::table_key::{AlterOperation, Key, TableKey};
 pub use self::value::Value;
 
 pub use self::sql_operator::SQLOperator;
 
 /// Like `vec.join(", ")`, but for any types implementing ToString.
-fn comma_separated_string<T: ToString>(vec: &[T]) -> String {
-    vec.iter()
-        .map(T::to_string)
+fn comma_separated_string<I>(iter: I) -> String
+where
+    I: IntoIterator,
+    I::Item: Deref,
+    <I::Item as Deref>::Target: ToString,
+{
+    iter.into_iter()
+        .map(|t| t.deref().to_string())
         .collect::<Vec<String>>()
         .join(", ")
 }
@@ -46,7 +53,7 @@ pub type SQLIdent = String;
 /// The parser does not distinguish between expressions of different types
 /// (e.g. boolean vs string), so the caller must handle expressions of
 /// inappropriate type, like `WHERE 1` or `SELECT 1=1`, as necessary.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ASTNode {
     /// Identifier e.g. table name or column name
     SQLIdentifier(SQLIdent),
@@ -93,6 +100,10 @@ pub enum ASTNode {
         expr: Box<ASTNode>,
         data_type: SQLType,
     },
+    SQLExtract {
+        field: SQLDateTimeField,
+        expr: Box<ASTNode>,
+    },
     /// `expr COLLATE collation`
     SQLCollate {
         expr: Box<ASTNode>,
@@ -108,13 +119,7 @@ pub enum ASTNode {
     /// SQLValue
     SQLValue(Value),
     /// Scalar function call e.g. `LEFT(foo, 5)`
-    SQLFunction {
-        name: SQLObjectName,
-        args: Vec<ASTNode>,
-        over: Option<SQLWindowSpec>,
-        // aggregate functions may specify eg `COUNT(DISTINCT x)`
-        distinct: bool,
-    },
+    SQLFunction(SQLFunction),
     /// CASE [<operand>] WHEN <condition> THEN <result> ... [ELSE <result>] END
     /// Note we only recognize a complete single expression as <condition>, not
     /// `< 0` nor `1, 2, 3` as allowed in a <simple when clause> per
@@ -125,6 +130,9 @@ pub enum ASTNode {
         results: Vec<ASTNode>,
         else_result: Option<Box<ASTNode>>,
     },
+    /// An exists expression `EXISTS(SELECT ...)`, used in expressions like
+    /// `WHERE EXISTS (SELECT ...)`.
+    SQLExists(Box<SQLQuery>),
     /// A parenthesized subquery `(SELECT ...)`, used in expression like
     /// `SELECT (subquery) AS x` or `WHERE (subquery) = x`
     SQLSubquery(Box<SQLQuery>),
@@ -182,6 +190,9 @@ impl ToString for ASTNode {
                 expr.as_ref().to_string(),
                 data_type.to_string()
             ),
+            ASTNode::SQLExtract { field, expr } => {
+                format!("EXTRACT({} FROM {})", field.to_string(), expr.to_string())
+            }
             ASTNode::SQLCollate { expr, collation } => format!(
                 "{} COLLATE {}",
                 expr.as_ref().to_string(),
@@ -192,23 +203,7 @@ impl ToString for ASTNode {
                 format!("{} {}", operator.to_string(), expr.as_ref().to_string())
             }
             ASTNode::SQLValue(v) => v.to_string(),
-            ASTNode::SQLFunction {
-                name,
-                args,
-                over,
-                distinct,
-            } => {
-                let mut s = format!(
-                    "{}({}{})",
-                    name.to_string(),
-                    if *distinct { "DISTINCT " } else { "" },
-                    comma_separated_string(args)
-                );
-                if let Some(o) = over {
-                    s += &format!(" OVER ({})", o.to_string())
-                }
-                s
-            }
+            ASTNode::SQLFunction(f) => f.to_string(),
             ASTNode::SQLCase {
                 operand,
                 conditions,
@@ -230,13 +225,14 @@ impl ToString for ASTNode {
                 }
                 s + " END"
             }
+            ASTNode::SQLExists(s) => format!("EXISTS ({})", s.to_string()),
             ASTNode::SQLSubquery(s) => format!("({})", s.to_string()),
         }
     }
 }
 
 /// A window specification (i.e. `OVER (PARTITION BY .. ORDER BY .. etc.)`)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SQLWindowSpec {
     pub partition_by: Vec<ASTNode>,
     pub order_by: Vec<SQLOrderByExpr>,
@@ -280,7 +276,7 @@ impl ToString for SQLWindowSpec {
 
 /// Specifies the data processed by a window function, e.g.
 /// `RANGE UNBOUNDED PRECEDING` or `ROWS BETWEEN 5 PRECEDING AND CURRENT ROW`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SQLWindowFrame {
     pub units: SQLWindowFrameUnits,
     pub start_bound: SQLWindowFrameBound,
@@ -289,7 +285,7 @@ pub struct SQLWindowFrame {
     // TBD: EXCLUDE
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum SQLWindowFrameUnits {
     Rows,
     Range,
@@ -322,7 +318,7 @@ impl FromStr for SQLWindowFrameUnits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum SQLWindowFrameBound {
     /// "CURRENT ROW"
     CurrentRow,
@@ -346,7 +342,8 @@ impl ToString for SQLWindowFrameBound {
 }
 
 /// A top-level statement (SELECT, INSERT, CREATE, etc.)
-#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum SQLStatement {
     /// SELECT
     SQLQuery(Box<SQLQuery>),
@@ -356,8 +353,8 @@ pub enum SQLStatement {
         table_name: SQLObjectName,
         /// COLUMNS
         columns: Vec<SQLIdent>,
-        /// VALUES (vector of rows to insert)
-        values: Vec<Vec<ASTNode>>,
+        /// A SQL query that specifies what to insert
+        source: Box<SQLQuery>,
     },
     SQLCopy {
         /// TABLE
@@ -387,8 +384,10 @@ pub enum SQLStatement {
     SQLCreateView {
         /// View name
         name: SQLObjectName,
+        columns: Vec<SQLIdent>,
         query: Box<SQLQuery>,
         materialized: bool,
+        with_options: Vec<SQLOption>,
     },
     /// CREATE TABLE
     SQLCreateTable {
@@ -396,6 +395,8 @@ pub enum SQLStatement {
         name: SQLObjectName,
         /// Optional schema
         columns: Vec<SQLColumnDef>,
+        constraints: Vec<TableConstraint>,
+        with_options: Vec<SQLOption>,
         external: bool,
         file_format: Option<FileFormat>,
         location: Option<String>,
@@ -404,7 +405,7 @@ pub enum SQLStatement {
     SQLAlterTable {
         /// Table name
         name: SQLObjectName,
-        operation: AlterOperation,
+        operation: AlterTableOperation,
     },
     /// DROP TABLE
     SQLDrop {
@@ -423,22 +424,13 @@ impl ToString for SQLStatement {
             SQLStatement::SQLInsert {
                 table_name,
                 columns,
-                values,
+                source,
             } => {
-                let mut s = format!("INSERT INTO {}", table_name.to_string());
+                let mut s = format!("INSERT INTO {} ", table_name.to_string());
                 if !columns.is_empty() {
-                    s += &format!(" ({})", columns.join(", "));
+                    s += &format!("({}) ", columns.join(", "));
                 }
-                if !values.is_empty() {
-                    s += &format!(
-                        " VALUES({})",
-                        values
-                            .iter()
-                            .map(|row| comma_separated_string(row))
-                            .collect::<Vec<String>>()
-                            .join(", ")
-                    );
-                }
+                s += &source.to_string();
                 s
             }
             SQLStatement::SQLCopy {
@@ -471,6 +463,7 @@ impl ToString for SQLStatement {
             } => {
                 let mut s = format!("UPDATE {}", table_name.to_string());
                 if !assignments.is_empty() {
+                    s += " SET ";
                     s += &comma_separated_string(assignments);
                 }
                 if let Some(selection) = selection {
@@ -490,35 +483,62 @@ impl ToString for SQLStatement {
             }
             SQLStatement::SQLCreateView {
                 name,
+                columns,
                 query,
                 materialized,
+                with_options,
             } => {
                 let modifier = if *materialized { " MATERIALIZED" } else { "" };
+                let with_options = if !with_options.is_empty() {
+                    format!(" WITH ({})", comma_separated_string(with_options))
+                } else {
+                    "".into()
+                };
+                let columns = if !columns.is_empty() {
+                    format!(" ({})", comma_separated_string(columns))
+                } else {
+                    "".into()
+                };
                 format!(
-                    "CREATE{} VIEW {} AS {}",
+                    "CREATE{} VIEW {}{}{} AS {}",
                     modifier,
                     name.to_string(),
-                    query.to_string()
+                    with_options,
+                    columns,
+                    query.to_string(),
                 )
             }
             SQLStatement::SQLCreateTable {
                 name,
                 columns,
+                constraints,
+                with_options,
                 external,
                 file_format,
                 location,
-            } if *external => format!(
-                "CREATE EXTERNAL TABLE {} ({}) STORED AS {} LOCATION '{}'",
-                name.to_string(),
-                comma_separated_string(columns),
-                file_format.as_ref().unwrap().to_string(),
-                location.as_ref().unwrap()
-            ),
-            SQLStatement::SQLCreateTable { name, columns, .. } => format!(
-                "CREATE TABLE {} ({})",
-                name.to_string(),
-                comma_separated_string(columns)
-            ),
+            } => {
+                let mut s = format!(
+                    "CREATE {}TABLE {} ({}",
+                    if *external { "EXTERNAL " } else { "" },
+                    name.to_string(),
+                    comma_separated_string(columns)
+                );
+                if !constraints.is_empty() {
+                    s += &format!(", {}", comma_separated_string(constraints));
+                }
+                s += ")";
+                if *external {
+                    s += &format!(
+                        " STORED AS {} LOCATION '{}'",
+                        file_format.as_ref().unwrap().to_string(),
+                        location.as_ref().unwrap()
+                    );
+                }
+                if !with_options.is_empty() {
+                    s += &format!(" WITH ({})", comma_separated_string(with_options));
+                }
+                s
+            }
             SQLStatement::SQLAlterTable { name, operation } => {
                 format!("ALTER TABLE {} {}", name.to_string(), operation.to_string())
             }
@@ -531,7 +551,7 @@ impl ToString for SQLStatement {
                 "DROP {}{} {}{}",
                 object_type.to_string(),
                 if *if_exists { " IF EXISTS" } else { "" },
-                comma_separated_string(&names),
+                comma_separated_string(names),
                 if *cascade { " CASCADE" } else { "" },
             ),
             SQLStatement::SQLTransaction(stmts) => format!(
@@ -543,7 +563,7 @@ impl ToString for SQLStatement {
 }
 
 /// A name of a table, view, custom type, etc., possibly multi-part, i.e. db.schema.obj
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SQLObjectName(pub Vec<SQLIdent>);
 
 impl ToString for SQLObjectName {
@@ -553,20 +573,20 @@ impl ToString for SQLObjectName {
 }
 
 /// SQL assignment `foo = expr` as used in SQLUpdate
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SQLAssignment {
-    id: SQLIdent,
-    value: ASTNode,
+    pub id: SQLIdent,
+    pub value: ASTNode,
 }
 
 impl ToString for SQLAssignment {
     fn to_string(&self) -> String {
-        format!("SET {} = {}", self.id, self.value.to_string())
+        format!("{} = {}", self.id, self.value.to_string())
     }
 }
 
 /// SQL column definition
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SQLColumnDef {
     pub name: SQLIdent,
     pub data_type: SQLType,
@@ -595,8 +615,56 @@ impl ToString for SQLColumnDef {
     }
 }
 
+/// SQL function
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct SQLFunction {
+    pub name: SQLObjectName,
+    pub args: Vec<ASTNode>,
+    pub over: Option<SQLWindowSpec>,
+    // aggregate functions may specify eg `COUNT(DISTINCT x)`
+    pub distinct: bool,
+}
+
+impl ToString for SQLFunction {
+    fn to_string(&self) -> String {
+        let mut s = format!(
+            "{}({}{})",
+            self.name.to_string(),
+            if self.distinct { "DISTINCT " } else { "" },
+            comma_separated_string(&self.args),
+        );
+        if let Some(o) = &self.over {
+            s += &format!(" OVER ({})", o.to_string())
+        }
+        s
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub enum SQLDateTimeField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+impl ToString for SQLDateTimeField {
+    fn to_string(&self) -> String {
+        match self {
+            SQLDateTimeField::Year => "YEAR".to_string(),
+            SQLDateTimeField::Month => "MONTH".to_string(),
+            SQLDateTimeField::Day => "DAY".to_string(),
+            SQLDateTimeField::Hour => "HOUR".to_string(),
+            SQLDateTimeField::Minute => "MINUTE".to_string(),
+            SQLDateTimeField::Second => "SECOND".to_string(),
+        }
+    }
+}
+
 /// External table's available file format
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum FileFormat {
     TEXTFILE,
     SEQUENCEFILE,
@@ -645,7 +713,7 @@ impl FromStr for FileFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum SQLObjectType {
     Table,
     View,
@@ -657,5 +725,17 @@ impl SQLObjectType {
             SQLObjectType::Table => "TABLE".into(),
             SQLObjectType::View => "VIEW".into(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct SQLOption {
+    pub name: SQLIdent,
+    pub value: Value,
+}
+
+impl ToString for SQLOption {
+    fn to_string(&self) -> String {
+        format!("{} = {}", self.name.to_string(), self.value.to_string())
     }
 }
